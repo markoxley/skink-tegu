@@ -1,0 +1,204 @@
+// File:    tegu_migrate.skink
+// Purpose: Ordered schema migrations for skink-tegu. Migrations carry a
+//          monotonically increasing integer version, a label, and up/down
+//          SQL. A `_schema_migrations` table records applied versions so
+//          Migrate is idempotent; Rollback undoes the last N in reverse
+//          order. Each migration runs inside its own transaction where
+//          the backend supports DDL transactions (postgres yes; sqlite
+//          yes; mysql/mssql partially — DDL is non-transactional there).
+module tegu_migrate
+
+import "std/str"
+import "std/errors"
+import "std/strconv"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "tegu_conn"
+import "tegu_dialect"
+
+// Migration is one schema change step.
+pub struct Migration {
+    Version: int64   // must be unique + applied in ascending order
+    Label:   string
+    Up:      string  // may contain ';' separated statements
+    Down:    string  // "" means not reversible
+}
+
+const VERSION_TABLE = "_schema_migrations"
+
+// ensureVersionTable creates the bookkeeping table.
+fn ensureVersionTable(c: *tegu_conn.Conn) -> errors.Error {
+    d := c.D
+    sql := str.Concat("CREATE TABLE IF NOT EXISTS ",
+        str.Concat(tegu_dialect.Quote(d, VERSION_TABLE),
+        str.Concat(" (version ", str.Concat(d.TInt,
+        str.Concat(" PRIMARY KEY, label ", str.Concat(d.TString, ")"))))))
+    _, err := tegu_conn.Exec(c, sql, []dbx_value.Value{})
+    return err
+}
+
+// applied returns the set of applied versions.
+fn applied(c: *tegu_conn.Conn) -> map[int64]bool {
+    seen := make(map[int64]bool)
+    rows, err := tegu_conn.Query(c,
+        str.Concat("SELECT version FROM ", tegu_dialect.Quote(c.D, VERSION_TABLE)),
+        []dbx_value.Value{})
+    if str.Len(err.message) > 0 {
+        return seen
+    }
+    for rows.Next() {
+        seen[dbx_value.AsInt64(rows.Row()[0])] = true
+    }
+    return seen
+}
+
+// markApplied records a version.
+fn markApplied(c: *tegu_conn.Conn, m: Migration) -> errors.Error {
+    sql := str.Concat("INSERT INTO ", str.Concat(tegu_dialect.Quote(c.D, VERSION_TABLE),
+        str.Concat(" (version, label) VALUES (",
+        str.Concat(tegu_dialect.Placeholder(c.D, 1),
+        str.Concat(", ", str.Concat(tegu_dialect.Placeholder(c.D, 2), ")"))))))
+    _, err := tegu_conn.Exec(c, sql,
+        []dbx_value.Value{dbx_value.Int(m.Version), dbx_value.Text(m.Label)})
+    return err
+}
+
+// markReverted removes a version row.
+fn markReverted(c: *tegu_conn.Conn, v: int64) -> errors.Error {
+    sql := str.Concat("DELETE FROM ", str.Concat(tegu_dialect.Quote(c.D, VERSION_TABLE),
+        str.Concat(" WHERE version = ", tegu_dialect.Placeholder(c.D, 1))))
+    _, err := tegu_conn.Exec(c, sql, []dbx_value.Value{dbx_value.Int(v)})
+    return err
+}
+
+// runStatements executes each ';'-separated non-empty statement.
+fn runStatements(c: *tegu_conn.Conn, sql: string) -> errors.Error {
+    start := 0
+    n := str.Len(sql)
+    i := 0
+    for i <= n {
+        if i == n || sql[i] == 59 { // ';'
+            stmt := str.Trim(str.Substr(sql, start, i - start))
+            if str.Len(stmt) > 0 {
+                _, err := tegu_conn.Exec(c, stmt, []dbx_value.Value{})
+                if str.Len(err.message) > 0 {
+                    return err
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return errors.New("")
+}
+
+// Migrate applies every pending migration in ascending version order.
+// Returns the number applied.
+pub fn Migrate(c: *tegu_conn.Conn, migrations: []Migration) -> (int, errors.Error) {
+    err := ensureVersionTable(c)
+    if str.Len(err.message) > 0 {
+        return 0, err
+    }
+    seen := applied(c)
+    // sort by version (insertion sort — counts are small)
+    var sorted []Migration
+    for i := 0; i < len(migrations); i = i + 1 {
+        sorted = append(sorted, migrations[i])
+    }
+    for i := 1; i < len(sorted); i = i + 1 {
+        j := i
+        for j > 0 && sorted[j-1].Version > sorted[j].Version {
+            tmp := sorted[j]
+            sorted[j] = sorted[j-1]
+            sorted[j-1] = tmp
+            j = j - 1
+        }
+    }
+    n := 0
+    for i := 0; i < len(sorted); i = i + 1 {
+        m := sorted[i]
+        if seen[m.Version] {
+            continue
+        }
+        tx, terr := tegu_conn.Begin(c)
+        if str.Len(terr.message) > 0 {
+            return n, terr
+        }
+        uerr := runStatements(&tx, m.Up)
+        if str.Len(uerr.message) > 0 {
+            tegu_conn.Rollback(&tx)
+            return n, errors.New(str.Concat("tegu: migration ", str.Concat(strconv.Itoa64(m.Version),
+                str.Concat(" failed: ", uerr.message))))
+        }
+        merr := markApplied(&tx, m)
+        if str.Len(merr.message) > 0 {
+            tegu_conn.Rollback(&tx)
+            return n, merr
+        }
+        cerr := tegu_conn.Commit(&tx)
+        if str.Len(cerr.message) > 0 {
+            return n, cerr
+        }
+        n = n + 1
+    }
+    return n, errors.New("")
+}
+
+// Rollback undoes the last `steps` applied migrations in descending
+// version order.
+pub fn Rollback(c: *tegu_conn.Conn, migrations: []Migration, steps: int) -> (int, errors.Error) {
+    ensureVersionTable(c)
+    seen := applied(c)
+    var appliedMigs []Migration
+    for i := 0; i < len(migrations); i = i + 1 {
+        if seen[migrations[i].Version] {
+            appliedMigs = append(appliedMigs, migrations[i])
+        }
+    }
+    // sort desc
+    for i := 1; i < len(appliedMigs); i = i + 1 {
+        j := i
+        for j > 0 && appliedMigs[j-1].Version < appliedMigs[j].Version {
+            tmp := appliedMigs[j]
+            appliedMigs[j] = appliedMigs[j-1]
+            appliedMigs[j-1] = tmp
+            j = j - 1
+        }
+    }
+    n := 0
+    for i := 0; i < len(appliedMigs) && n < steps; i = i + 1 {
+        m := appliedMigs[i]
+        if str.Len(m.Down) == 0 {
+            continue
+        }
+        tx, terr := tegu_conn.Begin(c)
+        if str.Len(terr.message) > 0 {
+            return n, terr
+        }
+        derr := runStatements(&tx, m.Down)
+        if str.Len(derr.message) > 0 {
+            tegu_conn.Rollback(&tx)
+            return n, derr
+        }
+        rerr := markReverted(&tx, m.Version)
+        if str.Len(rerr.message) > 0 {
+            tegu_conn.Rollback(&tx)
+            return n, rerr
+        }
+        tegu_conn.Commit(&tx)
+        n = n + 1
+    }
+    return n, errors.New("")
+}
+
+// Version reports the highest applied migration version (0 = none).
+pub fn Version(c: *tegu_conn.Conn) -> int64 {
+    ensureVersionTable(c)
+    seen := applied(c)
+    hi := int64(0)
+    for v, _ in seen {
+        if v > hi {
+            hi = v
+        }
+    }
+    return hi
+}

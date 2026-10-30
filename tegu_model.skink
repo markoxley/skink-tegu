@@ -1,0 +1,439 @@
+// File:    tegu_model.skink
+// Purpose: Struct↔table model layer for skink-tegu. A Model binds a
+//          struct type (via reflect.Type) to a table on a Conn,
+//          resolving column names, primary key, and auto-increment
+//          once at construction. All field access goes through
+//          reflect's pointer API — callers pass int64(&obj) because
+//          generic type erasure prevents type parameters here.
+//
+//          Field tags (same convention as std/tegu):
+//            [column(name=x)] / [db(name=x)]  rename the column
+//            [db(pk)]                          primary key
+//            [db(auto)]                        auto-increment pk
+//            [db(ignore)]                      skip the field
+//            [db(notnull)]                     NOT NULL constraint
+//          A field named "id" is the pk when no [db(pk)] tag exists.
+module tegu_model
+
+import "std/str"
+import "std/errors"
+import "std/reflect"
+import "std/strconv"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "tegu_dialect"
+import "tegu_conn"
+
+// Model binds a Conn + Dialect to one struct type's table.
+pub struct Model {
+    conn:     *tegu_conn.Conn
+    typ:      reflect.Type
+    Name:     string
+    typeName: string
+    cols:     []string
+    fields:   []reflect.Field
+    pkIndex:  int
+    pkAuto:   bool
+}
+
+// validIdent reports whether s is a safe SQL identifier.
+fn validIdent(s: string) -> bool {
+    n := str.Len(s)
+    if n == 0 {
+        return false
+    }
+    for i := 0; i < n; i = i + 1 {
+        c := int(s[i])
+        ok := (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 ||
+            (i > 0 && c >= 48 && c <= 57)
+        if !ok {
+            return false
+        }
+    }
+    return true
+}
+
+// columnName resolves a field's column name from tags.
+fn columnName(f: reflect.Field) -> string {
+    if name, ok := reflect.TagKey(f.tag, "column", "name"); ok {
+        return name
+    }
+    if name, ok := reflect.TagKey(f.tag, "db", "name"); ok {
+        return name
+    }
+    return f.name
+}
+
+// supportedType reports whether a Skink field type maps to a column.
+fn supportedType(typeName: string) -> bool {
+    return str.Equal(typeName, "int") || str.Equal(typeName, "int64") ||
+        str.Equal(typeName, "string") || str.Equal(typeName, "float") ||
+        str.Equal(typeName, "bool")
+}
+
+// ModelOf binds conn to table name for type t (lowercased + "s").
+pub fn ModelOf(c: *tegu_conn.Conn, t: reflect.Type) -> (Model, errors.Error) {
+    return ModelNamed(c, t, str.Concat(str.ToLower(reflect.TypeName(t)), "s"))
+}
+
+// ModelNamed is ModelOf with an explicit table name.
+pub fn ModelNamed(c: *tegu_conn.Conn, t: reflect.Type, name: string) -> (Model, errors.Error) {
+    m := Model{conn: c, typ: t, Name: name, pkIndex: -1}
+    if !validIdent(name) {
+        return m, errors.New("tegu: invalid table name")
+    }
+    m.typeName = reflect.TypeName(t)
+    n := reflect.FieldCount(t)
+    for i := 0; i < n; i = i + 1 {
+        f := reflect.FieldByIndex(t, i)
+        if reflect.TagHasFlag(f.tag, "db", "ignore") {
+            continue
+        }
+        if !supportedType(f.type_name) {
+            return m, errors.New(str.Concat("tegu: unsupported field type \"",
+                str.Concat(f.type_name, str.Concat("\" on \"", str.Concat(f.name, "\"")))))
+        }
+        cname := columnName(f)
+        if !validIdent(cname) {
+            return m, errors.New(str.Concat("tegu: invalid column name \"", str.Concat(cname, "\"")))
+        }
+        m.cols = append(m.cols, cname)
+        m.fields = append(m.fields, f)
+        if reflect.TagHasFlag(f.tag, "db", "pk") || (str.Equal(f.name, "id") && m.pkIndex < 0) {
+            m.pkIndex = len(m.cols) - 1
+            m.pkAuto = reflect.TagHasFlag(f.tag, "db", "auto")
+        }
+    }
+    return m, errors.None()
+}
+
+// Name returns the table name.
+pub fn TableName(m: Model) -> string {
+    return m.Name
+}
+
+// qq is the dialect-quoted name.
+fn qq(m: Model, name: string) -> string {
+    return tegu_dialect.Quote(m.conn.D, name)
+}
+
+// colType maps a field type to the dialect's column type.
+fn colType(m: Model, typeName: string) -> string {
+    if str.Equal(typeName, "string") {
+        return m.conn.D.TString
+    }
+    if str.Equal(typeName, "float") {
+        return m.conn.D.TFloat
+    }
+    return m.conn.D.TInt
+}
+
+// fieldValue reads field f's value out of the struct at ptr.
+fn fieldValue(ptr: int64, f: reflect.Field) -> dbx_value.Value {
+    if str.Equal(f.type_name, "string") {
+        return dbx_value.Text(reflect.GetString(ptr, f))
+    }
+    if str.Equal(f.type_name, "float") {
+        return dbx_value.Float(reflect.GetFloat(ptr, f))
+    }
+    if str.Equal(f.type_name, "bool") {
+        return dbx_value.Bool(reflect.GetBool(ptr, f))
+    }
+    if str.Equal(f.type_name, "int") {
+        return dbx_value.Int(int64(reflect.GetInt(ptr, f)))
+    }
+    return dbx_value.Int(reflect.GetInt64(ptr, f))
+}
+
+// setField stores a Value into field f of the struct at ptr.
+pub fn SetField(ptr: int64, f: reflect.Field, v: dbx_value.Value) {
+    if dbx_value.IsNull(v) {
+        return
+    }
+    if str.Equal(f.type_name, "string") {
+        reflect.SetString(ptr, f, dbx_value.AsString(v))
+    } else if str.Equal(f.type_name, "float") {
+        reflect.SetFloat(ptr, f, dbx_value.AsFloat(v))
+    } else if str.Equal(f.type_name, "bool") {
+        reflect.SetBool(ptr, f, dbx_value.AsBool(v))
+    } else if str.Equal(f.type_name, "int") {
+        reflect.SetInt(ptr, f, int(dbx_value.AsInt64(v)))
+    } else {
+        reflect.SetInt64(ptr, f, dbx_value.AsInt64(v))
+    }
+}
+
+// scanRow writes row's values into the struct at ptr, matching
+// columns to model fields by name.
+pub fn ScanRow(m: Model, ptr: int64, cols: []string, row: []dbx_value.Value) {
+    for i := 0; i < len(cols) && i < len(row); i = i + 1 {
+        for j := 0; j < len(m.cols); j = j + 1 {
+            if str.Equal(cols[i], m.cols[j]) {
+                SetField(ptr, m.fields[j], row[i])
+                break
+            }
+        }
+    }
+}
+
+// Create emits CREATE TABLE IF NOT EXISTS with dialect types. MSSQL
+// lacks IF NOT EXISTS — it uses an OBJECT_ID guard instead.
+pub fn Create(m: *Model) -> errors.Error {
+    b := str.NewBuilder(256)
+    if str.Equal(m.conn.D.Name, "mssql") {
+        b.Write("IF OBJECT_ID(N'")
+        b.Write(m.Name)
+        b.Write("', N'U') IS NULL CREATE TABLE ")
+        b.Write(qq(*m, m.Name))
+    } else {
+        b.Write("CREATE TABLE IF NOT EXISTS ")
+        b.Write(qq(*m, m.Name))
+    }
+    b.Write(" (")
+    for i := 0; i < len(m.cols); i = i + 1 {
+        if i > 0 {
+            b.Write(", ")
+        }
+        b.Write(qq(*m, m.cols[i]))
+        b.Write(" ")
+        if i == m.pkIndex && m.pkAuto {
+            b.Write(m.conn.D.TAutoPk)
+        } else {
+            b.Write(colType(*m, m.fields[i].type_name))
+            if i == m.pkIndex {
+                b.Write(" PRIMARY KEY")
+            }
+            if reflect.TagHasFlag(m.fields[i].tag, "db", "notnull") {
+                b.Write(" NOT NULL")
+            }
+        }
+    }
+    b.Write(")")
+    _, err := tegu_conn.Exec(m.conn, b.String(), []dbx_value.Value{})
+    return err
+}
+
+// Drop emits DROP TABLE IF EXISTS.
+pub fn Drop(m: *Model) -> errors.Error {
+    _, err := tegu_conn.Exec(m.conn, str.Concat("DROP TABLE IF EXISTS ", qq(*m, m.Name)),
+        []dbx_value.Value{})
+    return err
+}
+
+// colList returns "c1, c2, ..." quoted.
+fn colList(m: *Model, skipAutoPk: bool) -> string {
+    s := ""
+    n := 0
+    for i := 0; i < len(m.cols); i = i + 1 {
+        if skipAutoPk && i == m.pkIndex && m.pkAuto {
+            continue
+        }
+        if n > 0 {
+            s = str.Concat(s, ", ")
+        }
+        s = str.Concat(s, qq(*m, m.cols[i]))
+        n = n + 1
+    }
+    return s
+}
+
+// Insert inserts the struct at ptr; writes back an auto pk.
+pub fn Insert(m: *Model, ptr: int64) -> errors.Error {
+    var args []dbx_value.Value
+    var ph []string
+    n := 1
+    for i := 0; i < len(m.cols); i = i + 1 {
+        if i == m.pkIndex && m.pkAuto {
+            continue
+        }
+        args = append(args, fieldValue(ptr, m.fields[i]))
+        ph = append(ph, tegu_dialect.Placeholder(m.conn.D, n))
+        n = n + 1
+    }
+    sql := str.Concat("INSERT INTO ", str.Concat(qq(*m, m.Name),
+        str.Concat(" (", str.Concat(colList(m, true), ")"))))
+    if m.pkAuto && m.conn.D.HasOutput {
+        // mssql: SCOPE_IDENTITY() is NULL inside sp_executesql's scope,
+        // so the id must come back via OUTPUT in the INSERT itself.
+        sql = str.Concat(sql, str.Concat(" OUTPUT INSERTED.", qq(*m, m.cols[m.pkIndex])))
+    }
+    sql = str.Concat(sql, str.Concat(" VALUES (", str.Concat(joinStrs(ph, ", "), ")")))
+    if m.pkAuto && m.conn.D.HasOutput {
+        rows, err := tegu_conn.Query(m.conn, sql, args)
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        if rows.Next() {
+            reflect.SetInt64(ptr, m.fields[m.pkIndex], dbx_value.AsInt64(rows.Row()[0]))
+        }
+        return errors.New("")
+    }
+    if m.pkAuto && m.conn.D.HasReturn {
+        // postgres: RETURNING pk
+        sql = str.Concat(sql, str.Concat(" RETURNING ", qq(*m, m.cols[m.pkIndex])))
+        rows, err := tegu_conn.Query(m.conn, sql, args)
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        if rows.Next() {
+            reflect.SetInt64(ptr, m.fields[m.pkIndex], rows.Row()[0].I64)
+        }
+        return errors.New("")
+    }
+    _, err := tegu_conn.Exec(m.conn, sql, args)
+    if str.Len(err.message) > 0 {
+        return err
+    }
+    if m.pkAuto && str.Len(m.conn.D.LastPkSQL) > 0 {
+        rows, lerr := tegu_conn.Query(m.conn, m.conn.D.LastPkSQL, []dbx_value.Value{})
+        if str.Len(lerr.message) == 0 && rows.Next() {
+            reflect.SetInt64(ptr, m.fields[m.pkIndex], dbx_value.AsInt64(rows.Row()[0]))
+        }
+    }
+    return errors.New("")
+}
+
+// joinStrs joins strings with sep.
+pub fn joinStrs(parts: []string, sep: string) -> string {
+    out := ""
+    for i := 0; i < len(parts); i = i + 1 {
+        if i > 0 {
+            out = str.Concat(out, sep)
+        }
+        out = str.Concat(out, parts[i])
+    }
+    return out
+}
+
+// Get loads the row with pk into the struct at ptr. Returns false if
+// not found.
+pub fn Get(m: *Model, pk: int64, ptr: int64) -> bool {
+    if m.pkIndex < 0 {
+        return false
+    }
+    sql := str.Concat("SELECT ", str.Concat(colList(m, false),
+        str.Concat(" FROM ", str.Concat(qq(*m, m.Name),
+        str.Concat(" WHERE ", str.Concat(qq(*m, m.cols[m.pkIndex]),
+        str.Concat(" = ", tegu_dialect.Placeholder(m.conn.D, 1))))))))
+    rows, err := tegu_conn.Query(m.conn, sql, []dbx_value.Value{dbx_value.Int(pk)})
+    if str.Len(err.message) > 0 {
+        return false
+    }
+    if !rows.Next() {
+        return false
+    }
+    ScanRow(*m, ptr, rows.Columns, rows.Row())
+    return true
+}
+
+// Save updates the row identified by the struct's pk.
+pub fn Save(m: *Model, ptr: int64) -> errors.Error {
+    if m.pkIndex < 0 {
+        return errors.New("tegu: Save requires a primary key")
+    }
+    var args []dbx_value.Value
+    sets := ""
+    n := 1
+    for i := 0; i < len(m.cols); i = i + 1 {
+        if i == m.pkIndex {
+            continue
+        }
+        if n > 1 {
+            sets = str.Concat(sets, ", ")
+        }
+        sets = str.Concat(sets, str.Concat(qq(*m, m.cols[i]),
+            str.Concat(" = ", tegu_dialect.Placeholder(m.conn.D, n))))
+        args = append(args, fieldValue(ptr, m.fields[i]))
+        n = n + 1
+    }
+    args = append(args, fieldValue(ptr, m.fields[m.pkIndex]))
+    sql := str.Concat("UPDATE ", str.Concat(qq(*m, m.Name),
+        str.Concat(" SET ", str.Concat(sets,
+        str.Concat(" WHERE ", str.Concat(qq(*m, m.cols[m.pkIndex]),
+        str.Concat(" = ", tegu_dialect.Placeholder(m.conn.D, n))))))))
+    _, err := tegu_conn.Exec(m.conn, sql, args)
+    return err
+}
+
+// Delete removes the row with pk.
+pub fn Delete(m: *Model, pk: int64) -> errors.Error {
+    if m.pkIndex < 0 {
+        return errors.New("tegu: Delete requires a primary key")
+    }
+    sql := str.Concat("DELETE FROM ", str.Concat(qq(*m, m.Name),
+        str.Concat(" WHERE ", str.Concat(qq(*m, m.cols[m.pkIndex]),
+        str.Concat(" = ", tegu_dialect.Placeholder(m.conn.D, 1))))))
+    _, err := tegu_conn.Exec(m.conn, sql, []dbx_value.Value{dbx_value.Int(pk)})
+    return err
+}
+
+// ModelRows iterates a materialized row set, scanning each row into a
+// caller-provided struct pointer.
+pub struct ModelRows {
+    m:    Model
+    Rows: dbx_rows.Rows
+}
+
+// Next advances and scans into ptr (int64(&obj)).
+pub fn Next(mr: *ModelRows, ptr: int64) -> bool {
+    if !mr.Rows.Next() {
+        return false
+    }
+    ScanRow(mr.m, ptr, mr.Rows.Columns, mr.Rows.Row())
+    return true
+}
+
+// Count returns the number of rows.
+pub fn Count(mr: *ModelRows) -> int {
+    return mr.Rows.Count()
+}
+
+// Value returns the current row's value for a named column — used for
+// joined/auxiliary columns not part of the model.
+pub fn Value(mr: *ModelRows, name: string) -> (dbx_value.Value, bool) {
+    return mr.Rows.ByName(name)
+}
+
+// Where loads all rows matching clause ('?',' $n' or '@Pn' placeholders
+// must match the dialect — callers normally build conditions through
+// the Query builder which renders placeholders itself).
+pub fn Where(m: *Model, clause: string, args: []dbx_value.Value) -> ModelRows {
+    sql := str.Concat("SELECT ", str.Concat(colList(m, false),
+        str.Concat(" FROM ", str.Concat(qq(*m, m.Name),
+        str.Concat(" WHERE ", clause)))))
+    rows, err := tegu_conn.Query(m.conn, sql, args)
+    if str.Len(err.message) > 0 {
+        return ModelRows{m: *m, Rows: dbx_rows.EmptyRows(m.cols)}
+    }
+    return ModelRows{m: *m, Rows: rows}
+}
+
+// All loads every row.
+pub fn All(m: *Model) -> ModelRows {
+    sql := str.Concat("SELECT ", str.Concat(colList(m, false),
+        str.Concat(" FROM ", qq(*m, m.Name))))
+    rows, err := tegu_conn.Query(m.conn, sql, []dbx_value.Value{})
+    if str.Len(err.message) > 0 {
+        return ModelRows{m: *m, Rows: dbx_rows.EmptyRows(m.cols)}
+    }
+    return ModelRows{m: *m, Rows: rows}
+}
+
+// LoadRelated runs `SELECT * FROM child WHERE fkCol = <pk of struct at
+// ptr>` — the "eager load" path: fetch a parent's pk, then query the
+// children. Returns a ModelRows over the child model.
+pub fn LoadRelated(m: *Model, parentPtr: int64, child: Model, fkCol: string) -> ModelRows {
+    var key dbx_value.Value
+    if m.pkIndex >= 0 {
+        key = fieldValue(parentPtr, m.fields[m.pkIndex])
+    }
+    sql := str.Concat("SELECT ", str.Concat(colList(&child, false),
+        str.Concat(" FROM ", str.Concat(qq(child, child.Name),
+        str.Concat(" WHERE ", str.Concat(qq(child, fkCol),
+        str.Concat(" = ", tegu_dialect.Placeholder(m.conn.D, 1))))))))
+    rows, err := tegu_conn.Query(m.conn, sql, []dbx_value.Value{key})
+    if str.Len(err.message) > 0 {
+        return ModelRows{m: child, Rows: dbx_rows.EmptyRows(child.cols)}
+    }
+    return ModelRows{m: child, Rows: rows}
+}

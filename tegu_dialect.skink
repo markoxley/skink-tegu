@@ -1,0 +1,165 @@
+// File:    tegu_dialect.skink
+// Purpose: SQL dialect layer for skink-tegu. Every supported database
+//          (postgres, mysql/mariadb, mssql/sqlserver, sqlite3) differs
+//          in placeholder style, identifier quoting, auto-increment
+//          syntax, LIMIT/OFFSET spelling, and column type names. The
+//          Dialect value captures all of that so the rest of the ORM
+//          generates SQL dialect-neutrally.
+module tegu_dialect
+
+import "std/str"
+
+// Placeholder styles.
+pub const PH_QMARK = 0 // ? (mysql, sqlite)
+pub const PH_DOLLAR = 1 // $1..$n (postgres)
+pub const PH_NAMED  = 2 // @P1..@Pn (mssql)
+
+// Dialect describes one database family's SQL conventions.
+pub struct Dialect {
+    Name:      string // "postgres" | "mysql" | "mssql" | "sqlite"
+    PhStyle:   int
+    QuoteChar: string // `"` or backtick
+    // column type names for the generic kinds
+    TInt:     string // int/int64/bool
+    TFloat:   string // float
+    TString:  string // text
+    TBlob:    string // blob
+    TAutoPk:  string // full column def for an auto-inc int64 pk
+    LastPkSQL: string // query returning the last inserted pk, or ""
+    HasReturn: bool   // supports RETURNING for auto-pk insert
+    HasOutput: bool   // mssql: INSERT ... OUTPUT INSERTED.<pk>
+    TopOnly:   bool   // mssql: LIMIT via SELECT TOP
+}
+
+// Placeholder renders the nth (1-based) bind placeholder.
+pub fn Placeholder(d: Dialect, n: int) -> string {
+    if d.PhStyle == PH_DOLLAR {
+        return str.Concat("$", itoa(n))
+    }
+    if d.PhStyle == PH_NAMED {
+        return str.Concat("@P", itoa(n))
+    }
+    return "?"
+}
+
+// Quote renders an identifier quoted for the dialect. Callers must
+// have validated the identifier first (tegu_model does).
+pub fn Quote(d: Dialect, name: string) -> string {
+    return str.Concat(str.Concat(d.QuoteChar, name), d.QuoteChar)
+}
+
+// LimitOffset appends LIMIT/OFFSET to sql. For mssql (TopOnly) LIMIT
+// becomes TOP — handled by the builder before FROM — so here only
+// OFFSET/FETCH is appended.
+pub fn LimitOffset(d: Dialect, sql: string, lim: int, off: int) -> string {
+    if lim < 0 && off < 0 {
+        return sql
+    }
+    if d.TopOnly {
+        if off > 0 {
+            sql = str.Concat(sql, str.Concat(" OFFSET ", str.Concat(itoa(off), " ROWS")))
+            if lim >= 0 {
+                sql = str.Concat(sql, str.Concat(" FETCH NEXT ", str.Concat(itoa(lim), " ROWS ONLY")))
+            }
+        }
+        return sql
+    }
+    if lim >= 0 {
+        sql = str.Concat(sql, str.Concat(" LIMIT ", itoa(lim)))
+    }
+    if off > 0 {
+        sql = str.Concat(sql, str.Concat(" OFFSET ", itoa(off)))
+    }
+    return sql
+}
+
+// itoa without strconv dependency churn.
+fn itoa(n: int) -> string {
+    if n == 0 {
+        return "0"
+    }
+    s := ""
+    m := n
+    for m > 0 {
+        d := m % 10
+        s = str.Concat(str.Substr("0123456789", d, 1), s)
+        m = m / 10
+    }
+    return s
+}
+
+// postgres returns the PG dialect.
+pub fn Postgres() -> Dialect {
+    return Dialect{
+        Name: "postgres", PhStyle: PH_DOLLAR, QuoteChar: "\"",
+        TInt: "BIGINT", TFloat: "DOUBLE PRECISION", TString: "TEXT",
+        TBlob: "BYTEA", TAutoPk: "BIGSERIAL PRIMARY KEY",
+        LastPkSQL: "", HasReturn: true, HasOutput: false, TopOnly: false,
+    }
+}
+
+// mysql returns the MySQL/MariaDB dialect.
+pub fn Mysql() -> Dialect {
+    return Dialect{
+        Name: "mysql", PhStyle: PH_QMARK, QuoteChar: "`",
+        TInt: "BIGINT", TFloat: "DOUBLE", TString: "TEXT",
+        TBlob: "BLOB", TAutoPk: "BIGINT AUTO_INCREMENT PRIMARY KEY",
+        LastPkSQL: "SELECT LAST_INSERT_ID()", HasReturn: false, HasOutput: false, TopOnly: false,
+    }
+}
+
+// mssql returns the SQL Server dialect.
+pub fn Mssql() -> Dialect {
+    return Dialect{
+        Name: "mssql", PhStyle: PH_NAMED, QuoteChar: "\"",
+        TInt: "BIGINT", TFloat: "FLOAT", TString: "NVARCHAR(255)",
+        TBlob: "VARBINARY(MAX)", TAutoPk: "BIGINT IDENTITY(1,1) PRIMARY KEY",
+        LastPkSQL: "",
+        HasReturn: false, HasOutput: true, TopOnly: true,
+    }
+}
+
+// sqlite returns the SQLite dialect.
+pub fn Sqlite() -> Dialect {
+    return Dialect{
+        Name: "sqlite", PhStyle: PH_QMARK, QuoteChar: "\"",
+        TInt: "INTEGER", TFloat: "REAL", TString: "TEXT",
+        TBlob: "BLOB", TAutoPk: "INTEGER PRIMARY KEY AUTOINCREMENT",
+        LastPkSQL: "SELECT last_insert_rowid()", HasReturn: false, HasOutput: false, TopOnly: false,
+    }
+}
+
+// DialectFor resolves a scheme/driver name to its Dialect.
+// Returns false for unknown schemes.
+pub fn DialectFor(scheme: string) -> (Dialect, bool) {
+    if str.Equal(scheme, "postgres") || str.Equal(scheme, "postgresql") ||
+        str.Equal(scheme, "pg") {
+        return Postgres(), true
+    }
+    if str.Equal(scheme, "mysql") || str.Equal(scheme, "mariadb") {
+        return Mysql(), true
+    }
+    if str.Equal(scheme, "mssql") || str.Equal(scheme, "sqlserver") {
+        return Mssql(), true
+    }
+    if str.Equal(scheme, "sqlite") || str.Equal(scheme, "sqlite3") {
+        return Sqlite(), true
+    }
+    return Dialect{}, false
+}
+
+// DialectOf infers the dialect from a DSN: explicit "scheme://" prefix,
+// or a sqlite path otherwise (":memory:", "file:", plain .db paths).
+pub fn DialectOf(dsn: string) -> (Dialect, bool) {
+    idx := str.IndexOf(dsn, "://")
+    if idx >= 0 {
+        scheme := str.Substr(dsn, 0, idx)
+        d, ok := DialectFor(scheme)
+        if ok {
+            return d, true
+        }
+        return Dialect{}, false
+    }
+    // No scheme: treat as sqlite path / :memory:.
+    return Sqlite(), true
+}

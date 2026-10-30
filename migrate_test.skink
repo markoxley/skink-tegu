@@ -1,0 +1,82 @@
+// File:    migrate_test.skink
+// Purpose: Migration tests — version table, idempotent apply, ordered
+//          application, rollback in reverse order. Runs on real
+//          SQLite in-memory.
+module migrate_test
+
+import "tegu_conn"
+import "tegu_model"
+import "tegu_migrate"
+import "tegu"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/reflect"
+import "std/str"
+import "std/testing"
+
+pub struct Widget {
+    [db(pk,auto)]
+    id:   int64
+    name: string
+}
+
+// TestMigrateUp applies migrations in version order and is idempotent.
+pub fn TestMigrateUp() {
+    c, _ := tegu.Open(":memory:")
+    migs := []tegu_migrate.Migration{
+        tegu_migrate.Migration{Version: int64(2), Label: "add age",
+            Up: "ALTER TABLE widgets ADD COLUMN age INTEGER", Down: ""},
+        tegu_migrate.Migration{Version: int64(1), Label: "create widgets",
+            Up: "CREATE TABLE widgets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)",
+            Down: "DROP TABLE widgets"},
+    }
+    n, err := tegu.Migrate(&c, migs)
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("migrate: ", err.message))
+    testing.AssertEqualInt(2, n, "two applied")
+    // idempotent
+    n, err = tegu.Migrate(&c, migs)
+    testing.AssertEqualInt(0, n, "idempotent")
+    testing.AssertTrue(str.Len(err.message) == 0, "still clean")
+    // insert via model — table exists with both cols
+    widgets, _ := tegu_model.ModelOf(&c, reflect.TypeOf<Widget>(Widget{}))
+    w := Widget{name: "w1"}
+    testing.AssertTrue(str.Len(tegu_model.Insert(&widgets, int64(&w)).message) == 0, "insert into migrated table")
+    testing.AssertTrue(w.id > int64(0), "pk")
+    tegu_conn.Close(&c)
+}
+
+// TestMigrateRollback reverts the latest migration.
+pub fn TestMigrateRollback() {
+    c, _ := tegu.Open(":memory:")
+    migs := []tegu_migrate.Migration{
+        tegu_migrate.Migration{Version: int64(1), Label: "create t1",
+            Up: "CREATE TABLE t1 (id INTEGER PRIMARY KEY)",
+            Down: "DROP TABLE t1"},
+        tegu_migrate.Migration{Version: int64(2), Label: "create t2",
+            Up: "CREATE TABLE t2 (id INTEGER PRIMARY KEY)",
+            Down: "DROP TABLE t2"},
+    }
+    n, _ := tegu.Migrate(&c, migs)
+    testing.AssertEqualInt(2, n, "both applied")
+    r, rerr := tegu_migrate.Rollback(&c, migs, 1)
+    testing.AssertTrue(str.Len(rerr.message) == 0, "rollback ok")
+    testing.AssertEqualInt(1, r, "one reverted")
+    // t2 gone: query fails; t1 still exists
+    _, err := tegu_conn.Query(&c, "SELECT * FROM t2", []dbx_value.Value{})
+    testing.AssertTrue(str.Len(err.message) > 0, "t2 dropped")
+    _, err = tegu_conn.Query(&c, "SELECT * FROM t1", []dbx_value.Value{})
+    testing.AssertTrue(str.Len(err.message) == 0, "t1 kept")
+    tegu_conn.Close(&c)
+}
+
+// TestMigrateVersion reports the top applied version.
+pub fn TestMigrateVersion() {
+    c, _ := tegu.Open(":memory:")
+    migs := []tegu_migrate.Migration{
+        tegu_migrate.Migration{Version: int64(3), Label: "v3", Up: "CREATE TABLE v3t (id INTEGER)", Down: "DROP TABLE v3t"},
+        tegu_migrate.Migration{Version: int64(5), Label: "v5", Up: "CREATE TABLE v5t (id INTEGER)", Down: "DROP TABLE v5t"},
+        tegu_migrate.Migration{Version: int64(4), Label: "v4", Up: "CREATE TABLE v4t (id INTEGER)", Down: "DROP TABLE v4t"},
+    }
+    tegu.Migrate(&c, migs)
+    testing.AssertTrue(tegu_migrate.Version(&c) == int64(5), "version = 5")
+    tegu_conn.Close(&c)
+}

@@ -1,0 +1,189 @@
+// File:    model_test.skink
+// Purpose: Model-layer tests against real SQLite in-memory — covers
+//          Create/Insert/Get/Save/Delete, auto-pk write-back, Where,
+//          All, LoadRelated, and transactions. Exercises the full
+//          tegu_conn sqlite adapter + reflect field mapping.
+module model_test
+
+import "tegu_conn"
+import "tegu_model"
+import "tegu_query"
+import "tegu"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/reflect"
+import "std/str"
+import "std/testing"
+
+pub struct User {
+    [db(pk,auto)]
+    id:   int64
+    [db(notnull)]
+    name: string
+    age:  int
+}
+
+pub struct Post {
+    [db(pk,auto)]
+    id:      int64
+    user_id: int64
+    title:   string
+}
+
+fn openMem() -> tegu_conn.Conn {
+    c, err := tegu.Open(":memory:")
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("open: ", err.message))
+    return c
+}
+
+// TestModelCrud covers the full Create→Insert→Get→Save→Delete flow.
+pub fn TestModelCrud() {
+    c := openMem()
+    users, err := tegu_model.ModelOf(&c, reflect.TypeOf<User>(User{}))
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("model: ", err.message))
+    testing.AssertEqualString("users", tegu_model.TableName(users), "table name")
+    testing.AssertTrue(str.Len(tegu_model.Create(&users).message) == 0, "create")
+
+    u := User{name: "ada", age: 36}
+    testing.AssertTrue(str.Len(tegu_model.Insert(&users, int64(&u)).message) == 0, "insert")
+    testing.AssertTrue(u.id > int64(0), "auto pk written back")
+
+    var got User
+    testing.AssertTrue(tegu_model.Get(&users, u.id, int64(&got)), "get")
+    testing.AssertEqualString("ada", got.name, "name roundtrip")
+    testing.AssertEqualInt(36, got.age, "age roundtrip")
+
+    got.age = 37
+    testing.AssertTrue(str.Len(tegu_model.Save(&users, int64(&got)).message) == 0, "save")
+    var got2 User
+    tegu_model.Get(&users, u.id, int64(&got2))
+    testing.AssertEqualInt(37, got2.age, "age after save")
+
+    testing.AssertTrue(str.Len(tegu_model.Delete(&users, u.id).message) == 0, "delete")
+    var gone User
+    testing.AssertFalse(tegu_model.Get(&users, u.id, int64(&gone)), "deleted")
+    tegu_conn.Close(&c)
+}
+
+// TestWhereAndAll covers filtered + unfiltered iteration.
+pub fn TestWhereAndAll() {
+    c := openMem()
+    users, _ := tegu_model.ModelOf(&c, reflect.TypeOf<User>(User{}))
+    tegu_model.Create(&users)
+    a := User{name: "ada", age: 36}
+    b := User{name: "grace", age: 85}
+    e := User{name: "linus", age: 55}
+    tegu_model.Insert(&users, int64(&a))
+    tegu_model.Insert(&users, int64(&b))
+    tegu_model.Insert(&users, int64(&e))
+
+    rows := tegu_model.Where(&users, "age > ?", []dbx_value.Value{dbx_value.Int(int64(50))})
+    n := 0
+    var u User
+    for tegu_model.Next(&rows, int64(&u)) {
+        n = n + 1
+        testing.AssertTrue(u.age > 50, "filtered")
+    }
+    testing.AssertEqualInt(2, n, "two over 50")
+
+    all := tegu_model.All(&users)
+    testing.AssertEqualInt(3, tegu_model.Count(&all), "all count")
+    tegu_conn.Close(&c)
+}
+
+// TestLoadRelated covers the has-many eager load.
+pub fn TestLoadRelated() {
+    c := openMem()
+    users, _ := tegu_model.ModelOf(&c, reflect.TypeOf<User>(User{}))
+    posts, _ := tegu_model.ModelOf(&c, reflect.TypeOf<Post>(Post{}))
+    tegu_model.Create(&users)
+    tegu_model.Create(&posts)
+    u := User{name: "ada", age: 36}
+    tegu_model.Insert(&users, int64(&u))
+    p1 := Post{user_id: u.id, title: "first"}
+    p2 := Post{user_id: u.id, title: "second"}
+    p3 := Post{user_id: int64(999), title: "other user"}
+    tegu_model.Insert(&posts, int64(&p1))
+    tegu_model.Insert(&posts, int64(&p2))
+    tegu_model.Insert(&posts, int64(&p3))
+
+    rows := tegu_model.LoadRelated(&users, int64(&u), posts, "user_id")
+    n := 0
+    var p Post
+    for tegu_model.Next(&rows, int64(&p)) {
+        n = n + 1
+        testing.AssertTrue(p.user_id == u.id, "fk match")
+    }
+    testing.AssertEqualInt(2, n, "two posts for ada")
+    tegu_conn.Close(&c)
+}
+
+// TestTx covers Begin/Commit/Rollback round-trips on sqlite.
+pub fn TestTx() {
+    c := openMem()
+    users, _ := tegu_model.ModelOf(&c, reflect.TypeOf<User>(User{}))
+    tegu_model.Create(&users)
+
+    tx, terr := tegu.Begin(&c)
+    testing.AssertTrue(str.Len(terr.message) == 0, "begin")
+    txUsers, _ := tegu_model.ModelOf(&tx, reflect.TypeOf<User>(User{}))
+    u := User{name: "tx-user", age: 1}
+    tegu_model.Insert(&txUsers, int64(&u))
+    testing.AssertTrue(str.Len(tegu.Commit(&tx).message) == 0, "commit")
+    testing.AssertEqualInt(1, tegu_model.Count(&tegu_model.All(&users)), "committed row")
+
+    tx, _ = tegu.Begin(&c)
+    txUsers, _ = tegu_model.ModelOf(&tx, reflect.TypeOf<User>(User{}))
+    u2 := User{name: "rolled-back", age: 2}
+    tegu_model.Insert(&txUsers, int64(&u2))
+    testing.AssertTrue(str.Len(tegu.Rollback(&tx).message) == 0, "rollback")
+    testing.AssertEqualInt(1, tegu_model.Count(&tegu_model.All(&users)), "rollback dropped row")
+    tegu_conn.Close(&c)
+}
+
+// TestBuilderSqlite runs the query builder end-to-end on sqlite.
+pub fn TestBuilderSqlite() {
+    c := openMem()
+    users, _ := tegu_model.ModelOf(&c, reflect.TypeOf<User>(User{}))
+    posts, _ := tegu_model.ModelOf(&c, reflect.TypeOf<Post>(Post{}))
+    tegu_model.Create(&users)
+    tegu_model.Create(&posts)
+    u := User{name: "ada", age: 36}
+    tegu_model.Insert(&users, int64(&u))
+    p := Post{user_id: u.id, title: "post1"}
+    tegu_model.Insert(&posts, int64(&p))
+
+    b := tegu_query.Select(&c, "users")
+    tegu_query.Join(&b, "LEFT JOIN", "posts", "posts.user_id = users.id")
+    tegu_query.ColsRaw(&b, "users.*, posts.title")
+    rows, err := tegu_query.Rows(&b)
+    testing.AssertTrue(str.Len(err.message) == 0, "join query")
+    n := 0
+    for rows.Next() {
+        n = n + 1
+    }
+    testing.AssertEqualInt(1, n, "one joined row")
+    tegu_conn.Close(&c)
+}
+
+// TestBuilderModelRows — regression: tegu_query.ModelRows must carry the
+// Model into the returned ModelRows; without it Next() scanned against
+// an empty column map and every struct came back zero-valued.
+pub fn TestBuilderModelRows() {
+    c := openMem()
+    users, err := tegu_model.ModelOf(&c, reflect.TypeOf<User>(User{}))
+    testing.AssertTrue(str.Len(err.message) == 0, "model")
+    tegu_model.Create(&users)
+    a := User{name: "ada", age: 36}
+    tegu_model.Insert(&users, int64(&a))
+    b := tegu_query.Select(&c, "users")
+    rows := tegu_query.ModelRows(&b, users)
+    n := 0
+    var u User
+    for tegu_model.Next(&rows, int64(&u)) {
+        n = n + 1
+        testing.AssertEqualString("ada", u.name, "scanned name")
+        testing.AssertEqualInt(36, u.age, "scanned age")
+    }
+    testing.AssertEqualInt(1, n, "one row scanned")
+    tegu_conn.Close(&c)
+}

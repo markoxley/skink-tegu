@@ -1,0 +1,132 @@
+// File:    tegu.skink
+// Purpose: Root module for skink-tegu — a database-agnostic ORM over
+//          skink-dbx drivers (postgres, mysql/mariadb, mssql) plus
+//          SQLite via std/db. Registers all bundled drivers at first
+//          use, so `tegu.Open("postgres://...")` works out of the box.
+//
+//          Layers:
+//            tegu_dialect — SQL dialect (placeholders, quoting, types)
+//            tegu_conn    — unified conn/tx over dbx + sqlite
+//            tegu_model   — struct↔table mapping (Create/Insert/Get/…)
+//            tegu_query   — fluent SELECT/UPDATE/DELETE builder + joins
+//            tegu_migrate — versioned migrations
+module tegu
+
+import "std/str"
+import "std/errors"
+import "std/reflect"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "mod/markoxley/skink-postgres/pg_dbx"
+import "mod/markoxley/skink-mysql/my_dbx"
+import "mod/markoxley/skink-mssql/ms_dbx"
+import "tegu_dialect"
+import "tegu_conn"
+import "tegu_model"
+import "tegu_query"
+import "tegu_migrate"
+
+var registered = false
+
+// registerDrivers lazily registers all bundled dbx drivers.
+fn registerDrivers() {
+    if registered {
+        return
+    }
+    pg_dbx.Register()
+    my_dbx.Register()
+    ms_dbx.Register()
+    registered = true
+}
+
+// Open connects to a database DSN. Schemes:
+//   postgres:// / postgresql://   → skink-postgres driver
+//   mysql:// / mariadb://         → skink-mysql driver
+//   mssql:// / sqlserver://       → skink-mssql driver
+//   sqlite:///path, :memory:, or a bare path → std/db SQLite
+// Returns the connection; check err for protocol/parse failures.
+pub fn Open(dsn: string) -> (tegu_conn.Conn, errors.Error) {
+    registerDrivers()
+    // sqlite has no wire DSN — detect explicitly.
+    if str.IndexOf(dsn, "sqlite://") == 0 || str.Equal(dsn, ":memory:") ||
+        str.EndsWith(dsn, ".db") || str.EndsWith(dsn, ".sqlite") {
+        return tegu_conn.OpenSqlite(dsn)
+    }
+    return tegu_conn.OpenDbx(dsn)
+}
+
+// OpenDialect connects using a scheme-appropriate backend; for sqlite
+// paths use Open.
+pub fn Close(c: *tegu_conn.Conn) -> errors.Error {
+    return tegu_conn.Close(c)
+}
+
+// ---- re-exports ---------------------------------------------------------------
+
+// Model binds a table for type t (see tegu_model.ModelOf).
+pub fn ModelOf(c: *tegu_conn.Conn, t: reflect.Type) -> (tegu_model.Model, errors.Error) {
+    return tegu_model.ModelOf(c, t)
+}
+
+// ModelNamed is ModelOf with an explicit table name.
+pub fn ModelNamed(c: *tegu_conn.Conn, t: reflect.Type, name: string) -> (tegu_model.Model, errors.Error) {
+    return tegu_model.ModelNamed(c, t, name)
+}
+
+// Select starts a query builder (see tegu_query).
+pub fn Select(c: *tegu_conn.Conn, table: string) -> tegu_query.Builder {
+    return tegu_query.Select(c, table)
+}
+
+// Begin starts a transaction returning a tx-scoped conn view.
+pub fn Begin(c: *tegu_conn.Conn) -> (tegu_conn.Conn, errors.Error) {
+    return tegu_conn.Begin(c)
+}
+
+// Commit commits a tx view.
+pub fn Commit(c: *tegu_conn.Conn) -> errors.Error {
+    return tegu_conn.Commit(c)
+}
+
+// Rollback aborts a tx view.
+pub fn Rollback(c: *tegu_conn.Conn) -> errors.Error {
+    return tegu_conn.Rollback(c)
+}
+
+// Migrate applies pending migrations.
+pub fn Migrate(c: *tegu_conn.Conn, ms: []tegu_migrate.Migration) -> (int, errors.Error) {
+    return tegu_migrate.Migrate(c, ms)
+}
+
+// Migration constructor convenience.
+pub fn Mig(version: int64, label: string, up: string, down: string) -> tegu_migrate.Migration {
+    return tegu_migrate.Migration{Version: version, Label: label, Up: up, Down: down}
+}
+
+// ---- dbx_value shorthands -------------------------------------------------------
+
+// Int makes an int arg.
+pub fn Int(v: int64) -> dbx_value.Value {
+    return dbx_value.Int(v)
+}
+
+// Text makes a text arg.
+pub fn Text(v: string) -> dbx_value.Value {
+    return dbx_value.Text(v)
+}
+
+// Float makes a float arg.
+pub fn Float(v: float) -> dbx_value.Value {
+    return dbx_value.Float(v)
+}
+
+// Bool makes a bool arg.
+pub fn Bool(v: bool) -> dbx_value.Value {
+    return dbx_value.Bool(v)
+}
+
+// Null makes a NULL arg.
+pub fn Null() -> dbx_value.Value {
+    return dbx_value.Null()
+}

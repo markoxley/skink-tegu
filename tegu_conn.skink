@@ -1,0 +1,219 @@
+// File:    tegu_conn.skink
+// Purpose: Unified connection layer for skink-tegu. A Conn is either a
+//          dbx driver connection (postgres/mysql/mssql) or a std/db
+//          SQLite connection, normalized to:
+//            Query(sql, args) -> (dbx_rows.Rows, errors.Error)
+//            Exec(sql, args)  -> (int64 affected, errors.Error)
+//          SQLite results are text-typed by the std/db API; the
+//          adapter converts them into dbx_value.Value so the rest of
+//          the ORM never sees which backend is underneath.
+module tegu_conn
+
+import "std/str"
+import "std/errors"
+import "std/db"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "tegu_dialect"
+
+// backend kinds
+pub const BK_DBX    = 1
+pub const BK_SQLITE = 2
+
+// Conn is one ORM connection.
+pub struct Conn {
+    Kind:    int
+    D:       tegu_dialect.Dialect
+    DbxConn: dbx_driver.Conn
+    Lite:    db.Connection
+    // tx state — set on a tx-session view
+    Dtx:  dbx_driver.Tx
+    InTx: bool
+}
+
+// OpenDbx connects through a registered dbx driver (caller must have
+// imported/registered the driver, e.g. via mssql.Register()).
+pub fn OpenDbx(dsn: string) -> (Conn, errors.Error) {
+    d, ok := tegu_dialect.DialectOf(dsn)
+    if !ok {
+        return Conn{}, errors.New(str.Concat("tegu: unknown DSN scheme in ", dsn))
+    }
+    dc, err := dbx_driver.Open(dsn)
+    if str.Len(err.message) > 0 {
+        return Conn{}, err
+    }
+    return Conn{Kind: BK_DBX, D: d, DbxConn: dc}, errors.New("")
+}
+
+// OpenSqlite opens a SQLite database via std/db. dsn is a file path or
+// ":memory:".
+pub fn OpenSqlite(dsn: string) -> (Conn, errors.Error) {
+    path := dsn
+    if str.IndexOf(path, "sqlite://") == 0 {
+        path = str.Substr(path, 9, str.Len(path) - 9)
+    }
+    lc, err := db.Open("sqlite3", path)
+    if str.Len(err.message) > 0 {
+        return Conn{}, err
+    }
+    return Conn{Kind: BK_SQLITE, D: tegu_dialect.Sqlite(), Lite: lc}, errors.New("")
+}
+
+// liteBind binds a dbx Value to a std/db statement index.
+fn liteBind(res: *db.Result, idx: int, v: dbx_value.Value) {
+    if dbx_value.IsNull(v) {
+        res.BindNull(idx)
+        return
+    }
+    if v.Kind == dbx_value.KIND_INT || v.Kind == dbx_value.KIND_TIME {
+        res.BindInt64(idx, v.I64)
+        return
+    }
+    if v.Kind == dbx_value.KIND_BOOL {
+        if v.Bool {
+            res.BindInt(idx, 1)
+        } else {
+            res.BindInt(idx, 0)
+        }
+        return
+    }
+    if v.Kind == dbx_value.KIND_FLOAT {
+        res.BindFloat(idx, v.F64)
+        return
+    }
+    res.BindText(idx, dbx_value.Bytes(v))
+}
+
+// textToValue converts a std/db Scan result (always text) into a Value.
+// Integers/floats stay text; the model layer parses on scan-in.
+fn textToValue(s: string) -> dbx_value.Value {
+    return dbx_value.Text(s)
+}
+
+// liteQuery runs sql with args on the std/db connection and
+// materializes all rows into dbx_rows.Rows.
+fn liteQuery(lc: *db.Connection, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    res, err := lc.Query(sql)
+    if str.Len(err.message) > 0 {
+        return dbx_rows.EmptyRows([]string{}), err
+    }
+    for i := 0; i < len(args); i = i + 1 {
+        liteBind(&res, i + 1, args[i])
+    }
+    var cols []string
+    nc := res.ColumnCount()
+    for i := 0; i < nc; i = i + 1 {
+        cn := res.ColumnName(i)
+        cols = append(cols, str.Substr(cn, 0, str.Len(cn)))
+    }
+    var data [][]dbx_value.Value
+    for res.Next() {
+        var row []dbx_value.Value
+        for i := 0; i < nc; i = i + 1 {
+            v, serr := res.Scan(i)
+            _ = serr
+            // Scan returns a pointer into the live stmt — copy before
+            // the next Next()/Close() invalidates it.
+            row = append(row, textToValue(str.Substr(v, 0, str.Len(v))))
+        }
+        data = append(data, row)
+    }
+    res.Close()
+    return dbx_rows.NewRows(cols, data), errors.New("")
+}
+
+// liteExec runs a non-row statement (still via Query — std/db prepares
+// then binds).
+fn liteExec(lc: *db.Connection, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    res, err := lc.Query(sql)
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    for i := 0; i < len(args); i = i + 1 {
+        liteBind(&res, i + 1, args[i])
+    }
+    res.Next()
+    res.Close()
+    return int64(0), errors.New("")
+}
+
+// Query runs sql and returns the materialized rows.
+pub fn Query(c: *Conn, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    if c.Kind == BK_SQLITE {
+        return liteQuery(&c.Lite, sql, args)
+    }
+    if c.InTx {
+        return c.Dtx.Query(sql, args)
+    }
+    return c.DbxConn.Query(sql, args)
+}
+
+// Exec runs sql and returns affected rows (0 for sqlite — std/db does
+// not report a count).
+pub fn Exec(c: *Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    if c.Kind == BK_SQLITE {
+        return liteExec(&c.Lite, sql, args)
+    }
+    if c.InTx {
+        return c.Dtx.Exec(sql, args)
+    }
+    return c.DbxConn.Exec(sql, args)
+}
+
+// Begin starts a transaction and returns a tx-scoped Conn view.
+// Commit/Rollback must be called on the returned view.
+pub fn Begin(c: *Conn) -> (Conn, errors.Error) {
+    if c.Kind == BK_SQLITE {
+        _, err := liteExec(&c.Lite, "BEGIN", []dbx_value.Value{})
+        if str.Len(err.message) > 0 {
+            return Conn{}, err
+        }
+        tx := *c
+        tx.InTx = true
+        return tx, errors.New("")
+    }
+    t, err := c.DbxConn.Begin()
+    if str.Len(err.message) > 0 {
+        return Conn{}, err
+    }
+    tx := *c
+    tx.Dtx = t
+    tx.InTx = true
+    return tx, errors.New("")
+}
+
+// Commit commits a tx-session view.
+pub fn Commit(c: *Conn) -> errors.Error {
+    if c.Kind == BK_SQLITE {
+        _, err := liteExec(&c.Lite, "COMMIT", []dbx_value.Value{})
+        return err
+    }
+    return c.Dtx.Commit()
+}
+
+// Rollback aborts a tx-session view.
+pub fn Rollback(c: *Conn) -> errors.Error {
+    if c.Kind == BK_SQLITE {
+        _, err := liteExec(&c.Lite, "ROLLBACK", []dbx_value.Value{})
+        return err
+    }
+    return c.Dtx.Rollback()
+}
+
+// Ping checks connectivity (sqlite always ok — file opens eagerly).
+pub fn Ping(c: *Conn) -> errors.Error {
+    if c.Kind == BK_SQLITE {
+        return errors.New("")
+    }
+    return c.DbxConn.Ping()
+}
+
+// Close releases the connection.
+pub fn Close(c: *Conn) -> errors.Error {
+    if c.Kind == BK_SQLITE {
+        return c.Lite.Close()
+    }
+    return c.DbxConn.Close()
+}

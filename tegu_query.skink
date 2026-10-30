@@ -1,0 +1,274 @@
+// File:    tegu_query.skink
+// Purpose: Fluent SELECT/UPDATE/DELETE builder for skink-tegu. Produces
+//          dialect-correct SQL plus a parallel []dbx_value.Value arg
+//          list — placeholders are rendered per dialect at Build()
+//          time, so callers write conditions with `?` and the builder
+//          rewrites them to $n/@Pn where needed.
+//
+//          Example:
+//            q := tegu_query.Select(conn, "users")
+//            q.Where("age > ?", tegu.Int(18))
+//            q.Join("posts p", "p.user_id = users.id")
+//            q.OrderBy("users.id ASC")
+//            q.Limit(10)
+//            rows, _ := q.Build()
+module tegu_query
+
+import "std/str"
+import "std/errors"
+import "std/strconv"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "tegu_dialect"
+import "tegu_conn"
+import "tegu_model"
+
+// Builder is a chainable SELECT builder bound to one Conn.
+pub struct Builder {
+    conn:    *tegu_conn.Conn
+    table:   string
+    cols:    []string   // raw column expressions
+    wheres:  []string   // AND-joined conditions
+    args:    []dbx_value.Value
+    joins:   []string   // full "kind JOIN t ON ..." clauses
+    orderBy: string
+    groupBy: string
+    having:  string
+    limit:   int
+    offset:  int
+    distinct: bool
+}
+
+// Select starts a builder: `Select(c, "users")`.
+pub fn Select(c: *tegu_conn.Conn, table: string) -> Builder {
+    return Builder{conn: c, table: table, limit: -1, offset: -1}
+}
+
+// Cols sets the projection list; default is `*`.
+pub fn Cols(self: *Builder, exprs: []string) -> *Builder {
+    self.cols = exprs
+    return self
+}
+
+// ColsRaw sets the projection from a comma-separated string.
+pub fn ColsRaw(self: *Builder, expr: string) -> *Builder {
+    self.cols = []string{expr}
+    return self
+}
+
+// Distinct adds DISTINCT.
+pub fn Distinct(self: *Builder) -> *Builder {
+    self.distinct = true
+    return self
+}
+
+// Where adds an AND condition with `?` placeholders for args.
+pub fn Where(self: *Builder, cond: string, args: []dbx_value.Value) -> *Builder {
+    self.wheres = append(self.wheres, cond)
+    for i := 0; i < len(args); i = i + 1 {
+        self.args = append(self.args, args[i])
+    }
+    return self
+}
+
+// Join adds a JOIN clause; kind is "JOIN" | "LEFT JOIN" | "INNER JOIN"...
+pub fn Join(self: *Builder, kind: string, table: string, on: string) -> *Builder {
+    self.joins = append(self.joins,
+        str.Concat(kind, str.Concat(" ", str.Concat(table, str.Concat(" ON ", on)))))
+    return self
+}
+
+// LeftJoin is Join("LEFT JOIN", ...).
+pub fn LeftJoin(self: *Builder, table: string, on: string) -> *Builder {
+    return Join(self, "LEFT JOIN", table, on)
+}
+
+// OrderBy sets ORDER BY expr.
+pub fn OrderBy(self: *Builder, expr: string) -> *Builder {
+    self.orderBy = expr
+    return self
+}
+
+// GroupBy sets GROUP BY expr.
+pub fn GroupBy(self: *Builder, expr: string) -> *Builder {
+    self.groupBy = expr
+    return self
+}
+
+// Having sets the HAVING condition (with `?` placeholders).
+pub fn Having(self: *Builder, cond: string, args: []dbx_value.Value) -> *Builder {
+    self.having = cond
+    for i := 0; i < len(args); i = i + 1 {
+        self.args = append(self.args, args[i])
+    }
+    return self
+}
+
+// Limit sets LIMIT n.
+pub fn Limit(self: *Builder, n: int) -> *Builder {
+    self.limit = n
+    return self
+}
+
+// Offset sets OFFSET n.
+pub fn Offset(self: *Builder, n: int) -> *Builder {
+    self.offset = n
+    return self
+}
+
+// rewriteQ replaces each '?' in cond with the dialect's nth
+// placeholder (counting continues across conditions). Skips '?' in
+// quotes/comments.
+fn rewriteQ(d: tegu_dialect.Dialect, cond: string, base: *int) -> string {
+    if d.PhStyle == tegu_dialect.PH_QMARK {
+        // still count placeholders for arg bookkeeping
+        for i := 0; i < str.Len(cond); i = i + 1 {
+            if cond[i] == 63 {
+                *base = *base + 1
+            }
+        }
+        return cond
+    }
+    out := ""
+    n := str.Len(cond)
+    i := 0
+    for i < n {
+        c := cond[i]
+        if c == 39 { // '...'
+            j := i + 1
+            for j < n && cond[j] != 39 {
+                j = j + 1
+            }
+            if j < n {
+                j = j + 1
+            }
+            out = str.Concat(out, str.Substr(cond, i, j - i))
+            i = j
+            continue
+        }
+        if c == 63 {
+            *base = *base + 1
+            out = str.Concat(out, tegu_dialect.Placeholder(d, *base))
+            i = i + 1
+            continue
+        }
+        out = str.Concat(out, str.Substr(cond, i, 1))
+        i = i + 1
+    }
+    return out
+}
+
+// Build renders the SQL and returns it plus the arg list.
+pub fn Build(self: *Builder) -> (string, []dbx_value.Value) {
+    d := self.conn.D
+    sql := "SELECT "
+    if self.distinct {
+        sql = str.Concat(sql, "DISTINCT ")
+    }
+    // mssql TOP for LIMIT without offset
+    if d.TopOnly && self.limit >= 0 && self.offset <= 0 {
+        sql = str.Concat(sql, str.Concat("TOP ", str.Concat(strconv.Itoa(self.limit), " ")))
+    }
+    if len(self.cols) == 0 {
+        sql = str.Concat(sql, "*")
+    } else {
+        sql = str.Concat(sql, tegu_model.joinStrs(self.cols, ", "))
+    }
+    sql = str.Concat(sql, str.Concat(" FROM ", tegu_dialect.Quote(d, self.table)))
+    for i := 0; i < len(self.joins); i = i + 1 {
+        sql = str.Concat(sql, str.Concat(" ", self.joins[i]))
+    }
+    base := 0
+    if len(self.wheres) > 0 {
+        sql = str.Concat(sql, " WHERE ")
+        for i := 0; i < len(self.wheres); i = i + 1 {
+            if i > 0 {
+                sql = str.Concat(sql, " AND ")
+            }
+            sql = str.Concat(sql, str.Concat("(", str.Concat(rewriteQ(d, self.wheres[i], &base), ")")))
+        }
+    }
+    if str.Len(self.groupBy) > 0 {
+        sql = str.Concat(sql, str.Concat(" GROUP BY ", self.groupBy))
+    }
+    if str.Len(self.having) > 0 {
+        sql = str.Concat(sql, str.Concat(" HAVING ", rewriteQ(d, self.having, &base)))
+    }
+    if str.Len(self.orderBy) > 0 {
+        sql = str.Concat(sql, str.Concat(" ORDER BY ", self.orderBy))
+    }
+    sql = tegu_dialect.LimitOffset(d, sql, self.limit, self.offset)
+    return sql, self.args
+}
+
+// Rows runs the built query and returns materialized rows.
+pub fn Rows(self: *Builder) -> (dbx_rows.Rows, errors.Error) {
+    sql, args := self.Build()
+    return tegu_conn.Query(self.conn, sql, args)
+}
+
+// ModelRows runs the query and wraps the results for struct scanning.
+pub fn ModelRows(self: *Builder, m: tegu_model.Model) -> tegu_model.ModelRows {
+    rows, err := self.Rows()
+    if str.Len(err.message) > 0 {
+        return tegu_model.ModelRows{}
+    }
+    // The model must travel with the rows — without it Next() scans
+    // against an empty column map and every struct stays zeroed.
+    return tegu_model.ModelRows{m: m, Rows: rows}
+}
+
+// Update builds an UPDATE with SET pairs from cols→args.
+// wheres use '?' placeholders.
+pub fn Update(c: *tegu_conn.Conn, table: string, sets: []string,
+        setArgs: []dbx_value.Value, wheres: []string, whereArgs: []dbx_value.Value) -> errors.Error {
+    d := c.D
+    base := len(setArgs)
+    sql := str.Concat("UPDATE ", str.Concat(tegu_dialect.Quote(d, table), " SET "))
+    n := 1
+    for i := 0; i < len(sets); i = i + 1 {
+        if i > 0 {
+            sql = str.Concat(sql, ", ")
+        }
+        sql = str.Concat(sql, str.Concat(tegu_dialect.Quote(d, sets[i]),
+            str.Concat(" = ", tegu_dialect.Placeholder(d, n))))
+        n = n + 1
+    }
+    var args []dbx_value.Value
+    for i := 0; i < len(setArgs); i = i + 1 {
+        args = append(args, setArgs[i])
+    }
+    if len(wheres) > 0 {
+        sql = str.Concat(sql, " WHERE ")
+        for i := 0; i < len(wheres); i = i + 1 {
+            if i > 0 {
+                sql = str.Concat(sql, " AND ")
+            }
+            sql = str.Concat(sql, str.Concat("(", str.Concat(rewriteQ(d, wheres[i], &base), ")")))
+        }
+        for i := 0; i < len(whereArgs); i = i + 1 {
+            args = append(args, whereArgs[i])
+        }
+    }
+    _, err := tegu_conn.Exec(c, sql, args)
+    return err
+}
+
+// Delete builds a DELETE with '?'-placeholder wheres.
+pub fn Delete(c: *tegu_conn.Conn, table: string, wheres: []string,
+        whereArgs: []dbx_value.Value) -> errors.Error {
+    d := c.D
+    base := 0
+    sql := str.Concat("DELETE FROM ", tegu_dialect.Quote(d, table))
+    if len(wheres) > 0 {
+        sql = str.Concat(sql, " WHERE ")
+        for i := 0; i < len(wheres); i = i + 1 {
+            if i > 0 {
+                sql = str.Concat(sql, " AND ")
+            }
+            sql = str.Concat(sql, str.Concat("(", str.Concat(rewriteQ(d, wheres[i], &base), ")")))
+        }
+    }
+    _, err := tegu_conn.Exec(c, sql, whereArgs)
+    return err
+}

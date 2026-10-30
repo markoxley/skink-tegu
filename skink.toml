@@ -1,0 +1,21 @@
+# Skink Project Manifest (managed by scales)
+
+[package]
+name = "tegu"
+version = "0.1.0"
+author = "mark"
+entry = "tegu.skink"
+description = "Database-agnostic ORM for Skink: dialect-aware SQL builder, struct mapping, joins, eager relations, migrations — over dbx drivers (postgres/mysql/mssql) and SQLite"
+license = "Apache-2.0"
+
+[target]
+env = "std"
+no_std = false
+os = "any"
+arch = "any"
+
+[dependencies]
+"mod/markoxley/skink-dbx" = "0.1.0"
+"mod/markoxley/skink-postgres" = "0.1.0"
+"mod/markoxley/skink-mysql" = "0.1.0"
+"mod/markoxley/skink-mssql" = "0.1.0"

@@ -1,0 +1,153 @@
+// File:    live_test.skink
+// Purpose: Live integration test for skink-tegu against a real database.
+//          Skipped (exit 0) unless SKINK_ORM_DSN is set — set it to a
+//          postgres://, mysql://, or mssql:// DSN (e.g. a Podman
+//          container). Covers: Open → Model → Create → Insert with
+//          auto-pk write-back → Get → Save → LoadRelated → join query
+//          builder → tx commit/rollback → migrations → Drop, all over
+//          the real wire protocol.
+module main
+
+import "tegu"
+import "tegu_model"
+import "tegu_query"
+import "tegu_conn"
+import "tegu_migrate"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/reflect"
+import "std/str"
+import "std/os"
+import "std/errors"
+
+var failures = 0
+
+fn check(ok: bool, what: string) {
+    if !ok {
+        println("FAIL:", what)
+        failures = failures + 1
+    }
+}
+
+fn expectErr(e: errors.Error, what: string) {
+    if str.Len(e.message) > 0 {
+        check(false, str.Concat(what, str.Concat(" -> ", e.message)))
+    }
+}
+
+pub struct LiveUser {
+    [db(pk,auto)]
+    id:   int64
+    name: string
+    age:  int
+}
+
+pub struct LivePost {
+    [db(pk,auto)]
+    id:      int64
+    user_id: int64
+    title:   string
+}
+
+fn main() -> int {
+    dsn := os.Getenv("SKINK_ORM_DSN")
+    if str.Len(dsn) == 0 {
+        println("SKIP live_test: SKINK_ORM_DSN not set")
+        return 0
+    }
+    println("live test against", dsn)
+
+    c, err := tegu.Open(dsn)
+    expectErr(err, "open")
+    if str.Len(err.message) > 0 {
+        return 1
+    }
+    println("dialect:", c.D.Name)
+
+    users, merr := tegu_model.ModelNamed(&c, reflect.TypeOf<LiveUser>(LiveUser{}), "orm_live_users")
+    expectErr(merr, "model users")
+    posts, _ := tegu_model.ModelNamed(&c, reflect.TypeOf<LivePost>(LivePost{}), "orm_live_posts")
+
+    tegu_model.Drop(&users)
+    tegu_model.Drop(&posts)
+    expectErr(tegu_model.Create(&users), "create users")
+    expectErr(tegu_model.Create(&posts), "create posts")
+
+    // Insert + auto-pk write-back over the wire.
+    u := LiveUser{name: "ada", age: 36}
+    expectErr(tegu_model.Insert(&users, int64(&u)), "insert")
+    check(u.id > int64(0), "auto pk written back")
+
+    var got LiveUser
+    check(tegu_model.Get(&users, u.id, int64(&got)), "get")
+    check(str.Equal(got.name, "ada"), "name roundtrip")
+    check(got.age == 36, "age roundtrip")
+
+    got.age = 37
+    expectErr(tegu_model.Save(&users, int64(&got)), "save")
+    var got2 LiveUser
+    tegu_model.Get(&users, u.id, int64(&got2))
+    check(got2.age == 37, "save persisted")
+
+    // Children + has-many eager load.
+    p := LivePost{user_id: u.id, title: "hello"}
+    expectErr(tegu_model.Insert(&posts, int64(&p)), "insert post")
+    rel := tegu_model.LoadRelated(&users, int64(&u), posts, "user_id")
+    n := 0
+    var rp LivePost
+    for tegu_model.Next(&rel, int64(&rp)) {
+        n = n + 1
+        check(rp.user_id == u.id, "fk matches")
+    }
+    check(n == 1, "one related post")
+
+    // Fluent query builder with a join over the wire.
+    b := tegu_query.Select(&c, "orm_live_users")
+    tegu_query.Join(&b, "LEFT JOIN", "orm_live_posts p", "p.user_id = orm_live_users.id")
+    tegu_query.ColsRaw(&b, "orm_live_users.id, orm_live_users.name")
+    tegu_query.Where(&b, "orm_live_users.age > ?", []dbx_value.Value{dbx_value.Int(int64(30))})
+    jrows, jerr := tegu_query.Rows(&b)
+    expectErr(jerr, "join query")
+    check(jrows.Count() == 1, "join returned one row")
+
+    // Transaction commit and rollback.
+    tx, terr := tegu.Begin(&c)
+    expectErr(terr, "begin")
+    txu, _ := tegu_model.ModelNamed(&tx, reflect.TypeOf<LiveUser>(LiveUser{}), "orm_live_users")
+    tu := LiveUser{name: "tx-committed", age: 1}
+    tegu_model.Insert(&txu, int64(&tu))
+    expectErr(tegu.Commit(&tx), "commit")
+    check(tegu_model.Count(&tegu_model.All(&users)) == 2, "committed row visible")
+
+    tx, _ = tegu.Begin(&c)
+    txu, _ = tegu_model.ModelNamed(&tx, reflect.TypeOf<LiveUser>(LiveUser{}), "orm_live_users")
+    tu2 := LiveUser{name: "tx-rolled", age: 2}
+    tegu_model.Insert(&txu, int64(&tu2))
+    tegu.Rollback(&tx)
+    check(tegu_model.Count(&tegu_model.All(&users)) == 2, "rollback dropped row")
+
+    // Migrations — DDL is transactional on postgres/sqlite; mysql/mssql
+    // auto-commit DDL so only the apply path is asserted there.
+    migs := []tegu_migrate.Migration{
+        tegu_migrate.Migration{Version: int64(1), Label: "extra table",
+            Up:   "CREATE TABLE orm_live_mig (id BIGINT)",
+            Down: "DROP TABLE orm_live_mig"},
+    }
+    mn, merr2 := tegu.Migrate(&c, migs)
+    if str.Equal(c.D.Name, "postgres") {
+        expectErr(merr2, "migrate")
+        check(mn == 1, "one migration applied")
+    }
+
+    tegu_model.Drop(&posts)
+    tegu_model.Drop(&users)
+    tegu_conn.Exec(&c, "DROP TABLE orm_live_mig", []dbx_value.Value{})
+    tegu_conn.Exec(&c, "DROP TABLE _schema_migrations", []dbx_value.Value{})
+    tegu.Close(&c)
+
+    if failures > 0 {
+        println("FAIL live_test:", failures, "failures")
+        return 1
+    }
+    println("PASS live_test")
+    return 0
+}

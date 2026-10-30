@@ -1,0 +1,115 @@
+// File:    dialect_test.skink
+// Purpose: Dialect SQL-generation tests — placeholder styles, quoting,
+//          LIMIT/OFFSET/TOP spelling, identifier validation, and the
+//          query builder's '?'→dialect rewriting. No live DB needed:
+//          dialects produce SQL strings only.
+module dialect_test
+
+import "tegu_dialect"
+import "tegu_conn"
+import "tegu_query"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/testing"
+
+// TestPlaceholder checks ?, $n, @Pn forms.
+pub fn TestPlaceholder() {
+    pg := tegu_dialect.Postgres()
+    my := tegu_dialect.Mysql()
+    ms := tegu_dialect.Mssql()
+    testing.AssertEqualString("$1", tegu_dialect.Placeholder(pg, 1), "pg $1")
+    testing.AssertEqualString("$12", tegu_dialect.Placeholder(pg, 12), "pg $12")
+    testing.AssertEqualString("?", tegu_dialect.Placeholder(my, 3), "mysql ?")
+    testing.AssertEqualString("@P1", tegu_dialect.Placeholder(ms, 1), "mssql @P1")
+    testing.AssertEqualString("@P2", tegu_dialect.Placeholder(ms, 2), "mssql @P2")
+}
+
+// TestQuote checks identifier quoting per dialect.
+pub fn TestQuote() {
+    pg := tegu_dialect.Postgres()
+    my := tegu_dialect.Mysql()
+    testing.AssertEqualString("\"users\"", tegu_dialect.Quote(pg, "users"), "pg quote")
+    testing.AssertEqualString("`users`", tegu_dialect.Quote(my, "users"), "mysql quote")
+}
+
+// TestDialectFor covers scheme resolution + aliases.
+pub fn TestDialectFor() {
+    _, ok := tegu_dialect.DialectFor("postgresql")
+    testing.AssertTrue(ok, "postgresql alias")
+    _, ok = tegu_dialect.DialectFor("mariadb")
+    testing.AssertTrue(ok, "mariadb alias")
+    _, ok = tegu_dialect.DialectFor("sqlserver")
+    testing.AssertTrue(ok, "sqlserver alias")
+    _, ok = tegu_dialect.DialectFor("sqlite3")
+    testing.AssertTrue(ok, "sqlite3 alias")
+    _, ok = tegu_dialect.DialectFor("mongo")
+    testing.AssertFalse(ok, "mongo is not relational")
+    d, ok := tegu_dialect.DialectOf(":memory:")
+    testing.AssertTrue(ok && str.Equal(d.Name, "sqlite"), ":memory: → sqlite")
+    d, ok = tegu_dialect.DialectOf("postgres://u:p@h/db")
+    testing.AssertTrue(ok && str.Equal(d.Name, "postgres"), "pg scheme")
+}
+
+// TestBuilderPostgres checks '?' → $n rewriting and quoting.
+pub fn TestBuilderPostgres() {
+    c := tegu_conn.Conn{Kind: tegu_conn.BK_DBX, D: tegu_dialect.Postgres()}
+    b := tegu_query.Select(&c, "users")
+    tegu_query.Where(&b, "age > ?", []dbx_value.Value{dbx_value.Int(int64(18))})
+    tegu_query.Where(&b, "name LIKE ? OR name LIKE ?", []dbx_value.Value{
+        dbx_value.Text("a%"), dbx_value.Text("b%")})
+    tegu_query.OrderBy(&b, "id ASC")
+    tegu_query.Limit(&b, 10)
+    sql, args := tegu_query.Build(&b)
+    testing.AssertContains(sql, "\"users\"", "pg quote")
+    testing.AssertContains(sql, "age > $1", "first ph")
+    testing.AssertContains(sql, "$2", "second ph")
+    testing.AssertContains(sql, "$3", "third ph")
+    testing.AssertContains(sql, "LIMIT 10", "limit")
+    testing.AssertEqualInt(3, len(args), "args")
+}
+
+// TestBuilderMysql checks backticks + ? pass-through.
+pub fn TestBuilderMysql() {
+    c := tegu_conn.Conn{Kind: tegu_conn.BK_DBX, D: tegu_dialect.Mysql()}
+    b := tegu_query.Select(&c, "orders")
+    tegu_query.Where(&b, "status = ?", []dbx_value.Value{dbx_value.Text("open")})
+    sql, _ := tegu_query.Build(&b)
+    testing.AssertContains(sql, "`orders`", "mysql backticks")
+    testing.AssertContains(sql, "status = ?", "qmark kept")
+}
+
+// TestBuilderMssql checks @Pn rewriting + TOP for limit.
+pub fn TestBuilderMssql() {
+    c := tegu_conn.Conn{Kind: tegu_conn.BK_DBX, D: tegu_dialect.Mssql()}
+    b := tegu_query.Select(&c, "users")
+    tegu_query.Where(&b, "age > ?", []dbx_value.Value{dbx_value.Int(int64(18))})
+    tegu_query.Limit(&b, 5)
+    sql, _ := tegu_query.Build(&b)
+    testing.AssertContains(sql, "TOP 5", "mssql TOP")
+    testing.AssertContains(sql, "age > @P1", "named ph")
+}
+
+// TestBuilderJoin checks JOIN clause assembly.
+pub fn TestBuilderJoin() {
+    c := tegu_conn.Conn{Kind: tegu_conn.BK_DBX, D: tegu_dialect.Postgres()}
+    b := tegu_query.Select(&c, "users")
+    tegu_query.Join(&b, "LEFT JOIN", "posts p", "p.user_id = users.id")
+    tegu_query.ColsRaw(&b, "users.*, count(p.id) AS post_count")
+    tegu_query.GroupBy(&b, "users.id")
+    tegu_query.Having(&b, "count(p.id) > ?", []dbx_value.Value{dbx_value.Int(int64(2))})
+    sql, args := tegu_query.Build(&b)
+    testing.AssertContains(sql, "LEFT JOIN posts p ON p.user_id = users.id", "join")
+    testing.AssertContains(sql, "GROUP BY users.id", "group by")
+    testing.AssertContains(sql, "HAVING count(p.id) > $1", "having ph")
+    testing.AssertEqualInt(1, len(args), "having arg")
+}
+
+// TestQuotedQ skips '?' inside string literals.
+pub fn TestQuotedQ() {
+    c := tegu_conn.Conn{Kind: tegu_conn.BK_DBX, D: tegu_dialect.Postgres()}
+    b := tegu_query.Select(&c, "t")
+    tegu_query.Where(&b, "note = 'a?b' AND x = ?", []dbx_value.Value{dbx_value.Int(int64(1))})
+    sql, _ := tegu_query.Build(&b)
+    testing.AssertContains(sql, "'a?b'", "literal kept")
+    testing.AssertContains(sql, "x = $1", "only real ? rewritten")
+}
