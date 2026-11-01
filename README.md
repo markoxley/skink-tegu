@@ -17,8 +17,8 @@ scales add markoxley/skink-tegu
 ## Quick start
 
 ```skink
-import "tegu"
-import "tegu_model"
+import "mod/markoxley/skink-tegu"
+import "mod/markoxley/skink-tegu/tegu_model"
 import "std/reflect"
 
 pub struct User {
@@ -69,7 +69,8 @@ Supported field types: `int`, `int64`, `string`, `float`, `bool`.
 ## Query builder + joins
 
 ```skink
-import "tegu_query"
+import "mod/markoxley/skink-tegu"
+import "mod/markoxley/skink-tegu/tegu_query"
 import "mod/markoxley/skink-dbx/dbx_value"
 
 b := tegu.Select(&c, "users")
@@ -95,7 +96,8 @@ for tegu_model.Next(&rel, int64(&p)) { /* u.id's posts */ }
 ## Migrations
 
 ```skink
-import "tegu_migrate"
+import "mod/markoxley/skink-tegu"
+import "mod/markoxley/skink-tegu/tegu_migrate"
 
 migs := []tegu_migrate.Migration{
     tegu.Mig(int64(1), "create widgets",
